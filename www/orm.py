@@ -117,3 +117,33 @@ class ModelMetaclass(type):
         mappings = dict()
         fields = []
         primary_key = None
+        for k, v in attrs.items():
+            if isinstance(v, Field):
+                logging.info(' found mapping:%s => %s'.format(k, v))
+                mappings[k] = v
+                if v.primary_key:
+                    if primary_key:
+                        raise RuntimeError(
+                            'Duplicate primary key for field:{}'.format(k))
+                    primary_key = k
+                else:
+                    fields.append(k)
+        if not primary_key:
+            raise RuntimeError('primary key not found')
+        for k in mappings.keys():
+            attrs.pop(k)
+        escaped_fields = list(map(lambda f: '`%s`' % f, fields))
+        attrs['__mappings__'] = mappings
+        attrs['__table__'] = table_name
+        attrs['__primary_key__'] = primary_key
+        attrs['__fields__'] = fields
+
+        attrs['__select__'] = 'select `%s`,%s from `%s`' % (
+            primary_key, ','.join(escaped_fields), table_name)
+        attrs['__insert__'] = 'insert into `%s` (%s, `%s`) values (%s)' % (table_name, ','.join(
+            escaped_fields), primary_key, create_args_string(len(escaped_fields) + 1))
+        attrs['__update__'] = 'update `%s` set %s where `%s`=?' % (table_name, ','.join(
+            map(lambda f: '`%s`=?' % (mappings.get(f).name or f), fields)), primary_key)
+        attrs['__delete__'] = 'delete from `%s` where `%s`=?' % (
+            table_name, primary_key)
+        return type.__new__(cls, name, bases, attrs)
