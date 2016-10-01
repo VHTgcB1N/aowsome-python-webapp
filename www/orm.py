@@ -1,6 +1,4 @@
 # -*- coding: utf-8 -*-
-
-import asyncio
 import logging
 import aiomysql
 
@@ -27,6 +25,13 @@ async def create_pool(loop, **kw):
         loop=loop)
 
 
+async def destory_pool():  # 销毁连接池
+    global __pool
+    if __pool is not None:
+        __pool.close()
+        await __pool.wait_closed()
+
+
 async def select(sql, args, size=None):
     log(sql, args)
     global __pool
@@ -42,51 +47,32 @@ async def select(sql, args, size=None):
         return rs
 
 
-async def execute(sql, args):
+async def execute(sql, args, autocommit=True):
     log(sql)
-    with(await __pool) as conn:
+    async with __pool.get() as conn:
+        if not autocommit:
+            await conn.begin()
         try:
-            cur = await conn.cursor()
-            await cur.execute(sql.replace('?', '%s', args))
-            affected = cur.rowcount
-            await cur.close()
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(sql.replace('?', '%s'), args)
+                affected = cur.rowcount
+            if not autocommit:
+                await conn.commit()
         except BaseException as e:
+            if not autocommit:
+                await conn.rollback()
             raise
         return affected
 
 
-class Model(dict, metaclass=ModelMetaclass):
-    """docstring for Model"""
-
-    def __init__(self, **kw):
-        super(Model, self).__init__(**kw)
-
-    def __getattr__(self, key):
-        try:
-            return self[key]
-        except KeyError:
-            raise AttributeError(r"model' object has no attributes '%s'" % key)
-
-    def __setattr__(self, key, value):
-        self[key] = value
-
-    def get_value(self, key):
-        return getattr(self, key, None)
-
-    def get_value_or_default(self, key):
-        value = getattr(self, key, None)
-        if value is None:
-            field = self.__mappings__[key]
-            if field.default is not None:
-                value = field.default() if callable(field.default) else field.default
-                logging.debug('using default value for %s:%s' %
-                              (key, str(value)))
-                setattr(self, key, value)
-        return value
+def create_args_string(num):
+    L = []
+    for n in range(num):
+        L.append('?')
+    return ', '.join(L)
 
 
 class Field(object):
-    """docstring for Field"""
 
     def __init__(self, name, column_type, primary_key, default):
         self.name = name
@@ -95,14 +81,37 @@ class Field(object):
         self.default = default
 
     def __str__(self):
-        return '<%s,%s:%s>' % (self.__class__.__name__, self.column_type, self.name)
+        return '<%s, %s:%s>' % (self.__class__.__name__, self.column_type, self.name)
 
 
 class StringField(Field):
-    """docstring for StringField"""
 
     def __init__(self, name=None, primary_key=False, default=None, ddl='varchar(100)'):
-        super(StringField, self).__init__(name, ddl, primary_key, default)
+        super().__init__(name, ddl, primary_key, default)
+
+
+class BooleanField(Field):
+
+    def __init__(self, name=None, default=False):
+        super().__init__(name, 'boolean', False, default)
+
+
+class IntegerField(Field):
+
+    def __init__(self, name=None, primary_key=False, default=0):
+        super().__init__(name, 'bigint', primary_key, default)
+
+
+class FloatField(Field):
+
+    def __init__(self, name=None, primary_key=False, default=0.0):
+        super().__init__(name, 'real', primary_key, default)
+
+
+class TextField(Field):
+
+    def __init__(self, name=None, default=None):
+        super().__init__(name, 'text', False, default)
 
 
 class ModelMetaclass(type):
@@ -147,3 +156,101 @@ class ModelMetaclass(type):
         attrs['__delete__'] = 'delete from `%s` where `%s`=?' % (
             table_name, primary_key)
         return type.__new__(cls, name, bases, attrs)
+
+
+class Model(dict, metaclass=ModelMetaclass):
+    """docstring for Model"""
+
+    def __init__(self, **kw):
+        super(Model, self).__init__(**kw)
+
+    def __getattr__(self, key):
+        try:
+            return self[key]
+        except KeyError:
+            raise AttributeError(r"model' object has no attributes '%s'" % key)
+
+    def __setattr__(self, key, value):
+        self[key] = value
+
+    @classmethod
+    async def findAll(cls, where=None, args=None, **kw):
+        ' find objects by where clause. '
+        sql = [cls.__select__]
+        if where:
+            sql.append('where')
+            sql.append(where)
+        if args is None:
+            args = []
+        orderBy = kw.get('orderBy', None)
+        if orderBy:
+            sql.append('order by')
+            sql.append(orderBy)
+        limit = kw.get('limit', None)
+        if limit is not None:
+            sql.append('limit')
+            if isinstance(limit, int):
+                sql.append('?')
+                args.append(limit)
+            elif isinstance(limit, tuple) and len(limit) == 2:
+                sql.append('?, ?')
+                args.extend(limit)
+            else:
+                raise ValueError('Invalid limit value: %s' % str(limit))
+        rs = await select(' '.join(sql), args)
+        return [cls(**r) for r in rs]
+
+    @classmethod
+    async def findNumber(cls, selectField, where=None, args=None):
+        ' find number by select and where. '
+        sql = ['select %s _num_ from `%s`' % (selectField, cls.__table__)]
+        if where:
+            sql.append('where')
+            sql.append(where)
+        rs = await select(' '.join(sql), args, 1)
+        if len(rs) == 0:
+            return None
+        return rs[0]['_num_']
+
+    @classmethod
+    async def find(cls, pk):
+        rs = await select('%s where `%s` =?' % (cls.__select__, cls.__primary_key__), [pk], 1)
+        if len(rs) == 0:
+            return None
+        return cls(**rs[0])
+
+    async def save(self):
+        args = list(map(self.get_value_or_default, self.__fields__))
+        args.append(self.get_value_or_default(self.__primary_key__))
+        rows = await execute(self.__insert__, args)
+        if rows != 1:
+            logging.warn('failed to insert record: affected rows:%s' % rows)
+
+    async def update(self):
+        args = list(map(self.getValue, self.__fields__))
+        args.append(self.getValue(self.__primary_key__))
+        rows = await execute(self.__update__, args)
+        if rows != 1:
+            logging.warn(
+                'failed to update by primary key: affected rows: %s' % rows)
+
+    async def remove(self):
+        args = [self.getValue(self.__primary_key__)]
+        rows = await execute(self.__delete__, args)
+        if rows != 1:
+            logging.warn(
+                'failed to remove by primary key: affected rows: %s' % rows)
+
+    def get_value(self, key):
+        return getattr(self, key, None)
+
+    def get_value_or_default(self, key):
+        value = getattr(self, key, None)
+        if value is None:
+            field = self.__mappings__[key]
+            if field.default is not None:
+                value = field.default() if callable(field.default) else field.default
+                logging.debug('using default value for %s:%s' %
+                              (key, str(value)))
+                setattr(self, key, value)
+        return value
