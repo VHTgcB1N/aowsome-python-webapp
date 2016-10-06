@@ -12,20 +12,21 @@ from apis import APIError
 from urllib import parse
 
 
-def fun(method, path):
-    '''
-    Define decorator @xxx('/path')
-    '''
+def request(path, *, method):
     def decorator(func):
         @functools.wraps(func)
         def wrapper(*args, **kw):
             return func(*args, **kw)
-        wrapper.__method__ = method
+        wrapper.__method__ = method.upper()
         wrapper.__route__ = path
+        return wrapper
+    return decorator
 
 
-get = functools.partial(fun, method='GET')
-post = functools.partial(fun, method='POST')
+get = functools.partial(request, method='get')
+post = functools.partial(request, method='post')
+put = functools.partial(request, method='put')
+delete = functools.partial(request, method='delete')
 
 
 def get_required_kw_args(fn):
