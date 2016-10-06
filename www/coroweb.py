@@ -12,7 +12,7 @@ from apis import APIError
 from urllib import parse
 
 
-def request(path, *, method):
+def request(path, method):
     def decorator(func):
         @functools.wraps(func)
         def wrapper(*args, **kw):
